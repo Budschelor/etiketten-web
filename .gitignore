@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+fotos/*
+!fotos/.gitkeep
+tm_liga_cache.json
