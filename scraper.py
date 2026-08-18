@@ -6,9 +6,25 @@ import requests
 import warnings
 import time
 import re
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
 warnings.filterwarnings('ignore')
+
+# Wie viele Spieler-Anfragen gleichzeitig statt nacheinander laufen. 6 ist an
+# der Anzahl paralleler Verbindungen orientiert, die ein normaler Browser pro
+# Seite offen haelt -- schneller als streng sequenziell, ohne verdaechtig
+# aggressiv auszusehen.
+PARALLEL_WORKERS = 6
+
+
+def _parallel_for(items, worker_fn, max_workers=PARALLEL_WORKERS):
+    """Fuehrt worker_fn(item) fuer jedes item nebenlaeufig aus. Die einzelnen
+    Transfermarkt-Anfragen pro Spieler sind voneinander unabhaengig -- I/O-
+    lastige Arbeit wie diese profitiert stark von Nebenlaeufigkeit, egal ob
+    lokal oder auf einem (langsameren) Server wie Render."""
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(worker_fn, items))
 
 HEADERS = {
     'User-Agent': (
@@ -259,19 +275,21 @@ def get_squad_stats(session, verein_id, saison='2025', wettbewerb='L3'):
     return players
 
 
-def get_player_profiles(session, players, delay=1.0):
+def get_player_profiles(session, players, delay=0.3):
     """
     Holt für jeden Spieler: Fuß, Größe, Im Team seit.
-    Ergänzt das players-Dict direkt.
+    Ergänzt das players-Dict direkt. Laeuft parallel (siehe _parallel_for).
     """
     total = len(players)
-    for i, (pid, data) in enumerate(players.items(), 1):
+
+    def _fetch(item):
+        i, (pid, data) = item
         print(f"  Profil {i}/{total}: {data['name']}...")
         try:
             soup = get_soup(session, data['profile_url'], delay=delay)
             info_table = soup.find('div', class_='info-table')
             if not info_table:
-                continue
+                return
 
             # Paare aus label (regular) + value (bold) aufbauen
             spans = info_table.find_all('span', class_='info-table__content')
@@ -297,19 +315,22 @@ def get_player_profiles(session, players, delay=1.0):
         except Exception as e:
             print(f"    Fehler beim Profil von {data['name']}: {e}")
 
+    _parallel_for(list(enumerate(players.items(), 1)), _fetch)
 
-def get_einsaetze_per_player(session, players, saison='2025', wettbewerb='L3', delay=0.8):
+
+def get_einsaetze_per_player(session, players, saison='2025', wettbewerb='L3', delay=0.3):
     """
     Holt für jeden Spieler Einsätze und Startelf via CEAPI.
     Einsätze = participationState=='played'
     Startelf  = played + isStarting==True
-    games_display = 'Einsätze (Startelf)'
+    games_display = 'Einsätze (Startelf)'. Laeuft parallel (siehe _parallel_for).
     """
     total = len(players)
     saison_int = int(saison)
     print(f"\n  Lade Einsätze/Startelf je Spieler ({total})...")
 
-    for i, (pid, data) in enumerate(players.items(), 1):
+    def _fetch(item):
+        i, (pid, data) = item
         print(f"  {i}/{total}: {data['name']}...")
         try:
             url = f'https://www.transfermarkt.de/ceapi/performance-game/{pid}'
@@ -327,7 +348,7 @@ def get_einsaetze_per_player(session, players, saison='2025', wettbewerb='L3', d
                 and g['statistics']['generalStatistics']['participationState'] == 'played'
             ]
             if not played:
-                continue
+                return
 
             einsaetze = len(played)
             startelf = sum(
@@ -338,6 +359,8 @@ def get_einsaetze_per_player(session, players, saison='2025', wettbewerb='L3', d
 
         except Exception as e:
             print(f"    Fehler für {data['name']}: {e}")
+
+    _parallel_for(list(enumerate(players.items(), 1)), _fetch)
 
 
 def get_goalkeeper_stats(session, players, saison='2025', wettbewerb='L3', delay=1.0):
@@ -384,29 +407,32 @@ def get_goalkeeper_stats(session, players, saison='2025', wettbewerb='L3', delay
             print(f"    TW-Stats Fehler für {data['name']}: {e}")
 
 
-def get_transfer_info(session, verein_id, delay=1.5):
+def get_transfer_info(session, verein_id, delay=0.3):
     """
     Holt Transferhistorie (Zugänge) für mehrere Saisons.
-    Gibt dict zurück: player_id → {prev_club, fee}
+    Gibt dict zurück: player_id → {prev_club, fee}. Die Saisons werden
+    parallel abgefragt (unabhaengige Anfragen), aber erst danach in der
+    richtigen Reihenfolge (neueste zuerst) zusammengefuehrt -- sonst koennte
+    durch Nebenlaeufigkeit ein aelterer Transfer einen neueren ueberschreiben.
     """
     print("  Lade Transferdaten (mehrere Saisons)...")
-    transfer_map = {}
+    saisons = ['2025', '2024', '2023', '2022', '2021', '2020', '2019']
 
-    for saison in ['2025', '2024', '2023', '2022', '2021', '2020', '2019']:
+    def _fetch(saison):
         url = (
             f'https://www.transfermarkt.de/x/transfers/verein/{verein_id}'
             f'/saison_id/{saison}'
         )
+        season_map = {}
         try:
             soup = get_soup(session, url, delay=delay)
             tables = soup.find_all('table', class_='items')
             if not tables:
-                continue
+                return saison, season_map
 
             # Erste Tabelle = Zugänge
             zugaenge_table = tables[0]
             rows = zugaenge_table.find_all('tr', class_=['odd', 'even'])
-            new_in_season = 0
             for row in rows:
                 cells = row.find_all('td')
                 if len(cells) < 10:
@@ -418,8 +444,7 @@ def get_transfer_info(session, verein_id, delay=1.5):
                     if '/spieler/' in a['href']:
                         pid = extract_player_id(a['href'])
                         break
-
-                if not pid or pid in transfer_map:
+                if not pid:
                     continue
 
                 # Herkunftsverein: cell 9
@@ -428,24 +453,36 @@ def get_transfer_info(session, verein_id, delay=1.5):
                 fee = cells[-1].get_text(strip=True) if cells else '-'
                 fee = fee if fee else 'ablösefrei'
 
-                transfer_map[pid] = {
-                    'prev_club': prev_club,
-                    'fee': fee,
-                }
-                new_in_season += 1
-
-            if new_in_season:
-                print(f"    Saison {saison}: {new_in_season} Zugänge")
+                season_map[pid] = {'prev_club': prev_club, 'fee': fee}
 
         except Exception as e:
             print(f"    Fehler Saison {saison}: {e}")
+        return saison, season_map
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as ex:
+        results = dict(ex.map(_fetch, saisons))
+
+    # Neueste Saison zuerst zusammenfuehren -- ein Spieler behaelt seinen
+    # jeweils juengsten Transfer, aeltere Duplikate werden uebersprungen.
+    transfer_map = {}
+    for saison in saisons:
+        season_map = results.get(saison, {})
+        neu = 0
+        for pid, info in season_map.items():
+            if pid not in transfer_map:
+                transfer_map[pid] = info
+                neu += 1
+        if neu:
+            print(f"    Saison {saison}: {neu} Zugänge")
 
     print(f"  → {len(transfer_map)} Transfer-Einträge gefunden.")
     return transfer_map
 
 
 def download_photo(session, url, player_id, photo_dir):
-    """Lädt Spielerfoto herunter und gibt lokalen Pfad zurück."""
+    """Lädt Spielerfoto herunter und gibt lokalen Pfad zurück.
+    Ein Versuch scheitert bei Fotos unter Last öfter mal an einem Timeout --
+    ein zweiter, kurzer Versuch behebt die meisten davon."""
     import os
     if not url:
         return None
@@ -453,15 +490,17 @@ def download_photo(session, url, player_id, photo_dir):
     local_path = os.path.join(photo_dir, f'{player_id}.{ext}')
     if os.path.exists(local_path):
         return local_path
-    try:
-        time.sleep(0.5)
-        r = session.get(url, timeout=15)
-        if r.status_code == 200:
-            with open(local_path, 'wb') as f:
-                f.write(r.content)
-            return local_path
-    except Exception as e:
-        print(f"    Foto-Fehler für {player_id}: {e}")
+    for versuch in (1, 2):
+        try:
+            time.sleep(0.5)
+            r = session.get(url, timeout=20)
+            if r.status_code == 200:
+                with open(local_path, 'wb') as f:
+                    f.write(r.content)
+                return local_path
+        except Exception as e:
+            if versuch == 2:
+                print(f"    Foto-Fehler für {player_id}: {e}")
     return None
 
 
@@ -699,7 +738,10 @@ def collect_team_data(team_url, saison='2025', photo_dir='photos', wettbewerb='L
             since = data.get('team_since', '')
             data['transfer_info'] = f"Im Verein seit {since}" if since else '-'
 
-    # 6. Fotos herunterladen
+    # 6. Fotos herunterladen -- bewusst NICHT parallel: der Foto-CDN
+    # (img.a.transfermarkt.technology) vertraegt kaum Gleichzeitigkeit, schon
+    # bei 3 parallelen Downloads brechen die meisten mit Timeout ab. Einzeln
+    # nacheinander kommen sie zuverlaessig an.
     print(f"\n  Lade Fotos herunter nach '{photo_dir}'...")
     downloaded = 0
     for pid, data in players.items():
